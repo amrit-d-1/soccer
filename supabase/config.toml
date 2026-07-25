@@ -1,0 +1,16 @@
+# Supabase project config (minimal).
+# Only the Edge Function declarations that matter for this backend are pinned
+# here; everything else uses Supabase defaults.
+
+project_id = "soccer"
+
+[functions.send-rating-requests]
+# Triggered by the authenticated admin app (functions.invoke with the user's
+# JWT). Require a valid JWT so this cannot be called anonymously.
+verify_jwt = true
+
+[functions.twilio-inbound]
+# Public webhook hit by Twilio, which cannot present a Supabase JWT.
+# Must be callable without auth; Twilio request signatures should be verified
+# in production (out of scope here).
+verify_jwt = false
