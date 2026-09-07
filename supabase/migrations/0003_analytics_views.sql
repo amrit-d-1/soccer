@@ -1,226 +1,222 @@
 -- 0003_analytics_views.sql
--- All statistics live in Postgres VIEWS. The client renders these verbatim and
--- performs NO math of its own. Every view exposes sample sizes.
+-- Organizer-only analytics views. All stats computed in SQL; each view exposes
+-- its sample size. A 40% data-quality gate (response_rate >= 0.40) filters the
+-- aggregate views so sparsely-rated games do not skew results.
 --
--- Data-quality gate: aggregate views (#2-#5) EXCLUDE sessions whose response
--- rate is below 40% (too few raters to trust the mean). v_session_summary keeps
--- every session but flags the weak ones via is_low_response.
+-- Every view uses security_invoker = on: it runs with the caller's privileges,
+-- so the base-table RLS policies (which restrict rating/appearance rows to the
+-- owner or an organizer) apply. In practice only an organizer can see the full
+-- set of underlying rows, which is what makes these effectively organizer-only.
+-- We also revoke from anon and grant select to authenticated explicitly.
 
--- ---------------------------------------------------------------------------
--- 1) v_session_summary  — one row per session. Drives the Sessions list.
---    headcount is DERIVED from appearance rows (never stored).
---    stddev_overall uses stddev_samp -> null when fewer than 2 ratings.
--- ---------------------------------------------------------------------------
-create or replace view v_session_summary as
-with hc as (
-  select session_id, count(*) as headcount
+-- ===========================================================================
+-- v_game_summary : one row per game (admin game list + several charts)
+-- ===========================================================================
+create view v_game_summary
+with (security_invoker = on) as
+with app as (
+  select game_id, count(*) as headcount
   from appearance
-  group by session_id
+  group by game_id
 ),
-r as (
+rat as (
   select
-    session_id,
-    count(*)                 as response_count,
-    avg(overall)::numeric    as mean_overall,
-    stddev_samp(overall)     as stddev_overall,   -- null when < 2 ratings
-    avg(balance)::numeric    as mean_balance
+    game_id,
+    count(*)                     as response_count,
+    avg(overall)                 as mean_overall,
+    stddev_samp(overall)         as stddev_overall,  -- null when n < 2
+    avg(speed)                   as mean_speed,
+    avg(intensity)               as mean_intensity
   from rating
-  group by session_id
+  group by game_id
 )
 select
-  s.id,
-  s.played_at,
-  s.location,
-  s.notes,
-  s.ratings_close_at,
-  coalesce(hc.headcount, 0)      as headcount,
-  coalesce(r.response_count, 0)  as response_count,
-  (coalesce(r.response_count, 0)::numeric / nullif(hc.headcount, 0)) as response_rate,
-  r.mean_overall,
-  r.stddev_overall,
-  r.mean_balance,
-  ((coalesce(r.response_count, 0)::numeric / nullif(hc.headcount, 0)) < 0.40) as is_low_response
-from session s
-left join hc on hc.session_id = s.id
-left join r  on r.session_id  = s.id;
+  g.id,
+  g.starts_at,
+  g.location,
+  g.status,
+  coalesce(app.headcount, 0)                                      as headcount,
+  coalesce(rat.response_count, 0)                                 as response_count,
+  rat.response_count::numeric / nullif(app.headcount, 0)          as response_rate,
+  rat.mean_overall,
+  rat.stddev_overall,
+  rat.mean_speed,
+  rat.mean_intensity,
+  (rat.response_count::numeric / nullif(app.headcount, 0)) < 0.40 as is_low_response,
+  extract(dow  from g.starts_at)                                  as dow,
+  extract(hour from g.starts_at)                                  as hour
+from game g
+left join app on app.game_id = g.id
+left join rat on rat.game_id = g.id;
 
-comment on view v_session_summary is
-  'One row per session with derived headcount, response rate, and rating stats. '
-  'Keeps low-response sessions but flags them via is_low_response (response_rate < 0.40).';
+comment on view v_game_summary is
+  'One row per game with headcount, rating counts/means, response_rate, '
+  'low-response flag, and day-of-week/hour. Base for the other analytics views.';
 
--- ---------------------------------------------------------------------------
--- 2) v_headcount_effect  — does turnout affect perceived game quality?
---    Buckets QUALIFYING sessions (response_rate >= 0.40) by headcount.
--- ---------------------------------------------------------------------------
-create or replace view v_headcount_effect as
-with q as (
-  select id as session_id, headcount
-  from v_session_summary
+-- ===========================================================================
+-- v_headcount_effect : does crowd size affect game quality?
+-- Qualifying games (response_rate >= 0.40) bucketed by headcount.
+-- ===========================================================================
+create view v_headcount_effect
+with (security_invoker = on) as
+with qual as (
+  select id as game_id, headcount
+  from v_game_summary
   where response_rate >= 0.40
 ),
 bucketed as (
   select
-    q.session_id,
+    q.game_id,
     case
       when q.headcount <= 10 then '≤10'
-      when q.headcount between 11 and 13 then '11–13'
-      when q.headcount between 14 and 16 then '14–16'
+      when q.headcount <= 13 then '11–13'
+      when q.headcount <= 16 then '14–16'
       else '17+'
     end as bucket,
     case
       when q.headcount <= 10 then 1
-      when q.headcount between 11 and 13 then 2
-      when q.headcount between 14 and 16 then 3
+      when q.headcount <= 13 then 2
+      when q.headcount <= 16 then 3
       else 4
     end as bucket_order
-  from q
+  from qual q
 )
 select
   b.bucket,
   b.bucket_order,
-  count(distinct b.session_id) as session_count,
-  avg(rt.overall)::numeric     as mean_rating,
-  count(rt.id)                 as n_ratings
+  count(distinct b.game_id) as session_count,
+  avg(r.overall)            as mean_rating,
+  count(*)                  as n_ratings
 from bucketed b
-join rating rt on rt.session_id = b.session_id
+join rating r on r.game_id = b.game_id
 group by b.bucket, b.bucket_order
 order by b.bucket_order;
 
 comment on view v_headcount_effect is
-  'Qualifying sessions (response_rate >= 0.40) bucketed by headcount, with mean '
-  'raw rating and n_ratings per bucket. Buckets: ≤10 / 11–13 / 14–16 / 17+.';
+  'Qualifying games (response_rate >= 0.40) bucketed by headcount, with '
+  'session_count, mean rating over ratings in the bucket, and n_ratings.';
 
--- ---------------------------------------------------------------------------
--- 3) v_player_presence  — is the game better/worse when a given player shows up?
---    Compares session mean_overall for sessions the player appeared in vs not,
---    over QUALIFYING sessions only. adjusted_with applies shrinkage toward the
---    global mean with pseudo-count k = 5. Includes ALL players (client splits on
---    has_enough_data = appearances >= 6).
--- ---------------------------------------------------------------------------
-create or replace view v_player_presence as
-with q as (
-  select id as session_id, mean_overall
-  from v_session_summary
+-- ===========================================================================
+-- v_daytime_effect : which day of week gives the best games?
+-- Qualifying games grouped by day-of-week.
+-- ===========================================================================
+create view v_daytime_effect
+with (security_invoker = on) as
+with qual as (
+  select id as game_id, dow
+  from v_game_summary
   where response_rate >= 0.40
-    and mean_overall is not null
+)
+select
+  q.dow::int as dow,
+  case q.dow::int
+    when 0 then 'Sun'
+    when 1 then 'Mon'
+    when 2 then 'Tue'
+    when 3 then 'Wed'
+    when 4 then 'Thu'
+    when 5 then 'Fri'
+    when 6 then 'Sat'
+  end                       as dow_label,
+  count(distinct q.game_id) as game_count,
+  avg(r.overall)            as mean_rating,
+  count(*)                  as n_ratings
+from qual q
+join rating r on r.game_id = q.game_id
+group by q.dow
+order by q.dow;
+
+comment on view v_daytime_effect is
+  'Qualifying games grouped by day-of-week (0=Sun..6=Sat) with game_count, '
+  'mean rating, and n_ratings. Answers which day yields the best games.';
+
+-- ===========================================================================
+-- v_player_presence : does a player''s presence lift game quality?
+-- Over qualifying games, compares mean game rating when a player is present vs
+-- absent, with k=5 shrinkage of the "present" mean toward the global mean.
+-- Includes ALL players.
+-- ===========================================================================
+create view v_player_presence
+with (security_invoker = on) as
+with qual as (
+  select id as game_id, mean_overall
+  from v_game_summary
+  where response_rate >= 0.40
 ),
-g as (
+gm as (
   select avg(mean_overall) as global_mean
-  from q
+  from qual
 ),
-per as (
+per_player as (
   select
     p.id   as player_id,
     p.name as name,
-    count(*) filter (where ap.player_id is not null) as n_with,
-    count(*) filter (where ap.player_id is null)     as n_without,
-    avg(q.mean_overall) filter (where ap.player_id is not null) as mean_with,
-    avg(q.mean_overall) filter (where ap.player_id is null)     as mean_without,
-    sum(q.mean_overall) filter (where ap.player_id is not null) as sum_with
+    count(*) filter (where a.id is not null)                as n_with,
+    count(*) filter (where a.id is null)                    as n_without,
+    avg(q.mean_overall) filter (where a.id is not null)     as mean_with,
+    avg(q.mean_overall) filter (where a.id is null)         as mean_without,
+    coalesce(sum(q.mean_overall) filter (where a.id is not null), 0) as sum_present
   from player p
-  cross join q
-  left join appearance ap
-    on ap.session_id = q.session_id
-   and ap.player_id  = p.id
+  cross join qual q
+  left join appearance a
+    on a.player_id = p.id and a.game_id = q.game_id
   group by p.id, p.name
 )
 select
-  per.player_id,
-  per.name,
-  per.n_with                              as appearances,
-  per.mean_with,
-  per.mean_without,
-  per.n_with,
-  per.n_without,
-  g.global_mean,
-  ((coalesce(per.sum_with, 0) + 5 * g.global_mean) / (per.n_with + 5)) as adjusted_with,
-  (((coalesce(per.sum_with, 0) + 5 * g.global_mean) / (per.n_with + 5)) - per.mean_without) as delta_adjusted,
-  (per.n_with >= 6) as has_enough_data
-from per
-cross join g;
+  pp.player_id,
+  pp.name,
+  pp.n_with                                                    as appearances,
+  pp.mean_with,
+  pp.mean_without,
+  pp.n_with,
+  pp.n_without,
+  gm.global_mean,
+  (pp.sum_present + 5 * gm.global_mean) / (pp.n_with + 5)      as adjusted_with,
+  (pp.sum_present + 5 * gm.global_mean) / (pp.n_with + 5)
+    - pp.mean_without                                          as delta_adjusted,
+  (pp.n_with >= 6)                                             as has_enough_data
+from per_player pp
+cross join gm
+order by delta_adjusted desc nulls last;
 
 comment on view v_player_presence is
-  'Per player: mean session quality when present vs absent over qualifying '
-  'sessions. adjusted_with = (sum_session_means_present + k*global_mean)/(n_with + k) '
-  'with k = 5 (shrinkage toward the global mean). has_enough_data = appearances >= 6.';
+  'Per player over qualifying games: mean game rating present vs absent, with '
+  'k=5 shrinkage of the present mean toward the global mean. adjusted_with = '
+  '(sum_present + 5*global_mean)/(n_with+5); has_enough_data = appearances>=6. '
+  'Includes all players (requires at least one qualifying game to populate).';
 
--- Convenience splits (client can also derive these from has_enough_data).
-create or replace view v_player_presence_qualified as
-  select * from v_player_presence where has_enough_data;
-
-comment on view v_player_presence_qualified is
-  'v_player_presence rows with appearances >= 6 (enough data to trust delta).';
-
-create or replace view v_player_presence_insufficient as
-  select * from v_player_presence where not has_enough_data;
-
-comment on view v_player_presence_insufficient is
-  'v_player_presence rows with appearances < 6 (insufficient data).';
-
--- ---------------------------------------------------------------------------
--- 4) v_disagreement  — do raters disagree more in unbalanced games?
---    One row per QUALIFYING session; client plots stddev_overall vs mean_balance.
--- ---------------------------------------------------------------------------
-create or replace view v_disagreement as
+-- ===========================================================================
+-- v_trend : game quality over time with a 4-game rolling average.
+-- ===========================================================================
+create view v_trend
+with (security_invoker = on) as
 select
-  vs.id          as session_id,
-  vs.played_at,
-  vs.stddev_overall,
-  vs.mean_balance,
-  vs.response_count as n_ratings
-from v_session_summary vs
-where vs.response_rate >= 0.40;
-
-comment on view v_disagreement is
-  'Qualifying sessions with rating disagreement (stddev_overall) vs mean_balance. '
-  'stddev_overall is null when a session has < 2 ratings.';
-
--- ---------------------------------------------------------------------------
--- 5) v_trend  — game quality over time with a 4-session rolling average.
---    QUALIFYING sessions ordered by played_at.
--- ---------------------------------------------------------------------------
-create or replace view v_trend as
-select
-  vs.played_at,
-  vs.mean_overall,
-  vs.response_count as n_ratings,
-  avg(vs.mean_overall) over (
-    order by vs.played_at
+  gs.starts_at,
+  gs.mean_overall,
+  gs.response_count as n_ratings,
+  avg(gs.mean_overall) over (
+    order by gs.starts_at
     rows between 3 preceding and current row
   ) as rolling_avg_4
-from v_session_summary vs
-where vs.response_rate >= 0.40
-order by vs.played_at;
+from v_game_summary gs
+where gs.response_rate >= 0.40
+order by gs.starts_at;
 
 comment on view v_trend is
-  'Qualifying sessions over time: mean_overall plus rolling_avg_4 (avg over the '
-  'current and 3 preceding qualifying sessions by played_at).';
+  'Qualifying games over time: game mean_overall, n_ratings, and a 4-game '
+  'rolling average of mean_overall (3 preceding rows + current).';
 
--- ---------------------------------------------------------------------------
--- Hardening: make views honor the base tables' RLS and keep anon locked out.
---
--- By default a Postgres view runs with the view owner's privileges and does NOT
--- enforce RLS on its underlying tables. Supabase's default grants also hand
--- `anon`/`authenticated` SELECT on new objects in `public`. Setting
--- security_invoker = on makes each view evaluate base-table RLS as the querying
--- role, so `anon` (which has no table policy) sees nothing. We also revoke anon
--- explicitly and grant only `authenticated`, belt-and-suspenders.
--- Requires Postgres 15+ (Supabase). Safe to re-run.
--- ---------------------------------------------------------------------------
-do $$
-declare v text;
-begin
-  foreach v in array array[
-    'v_session_summary',
-    'v_headcount_effect',
-    'v_player_presence',
-    'v_player_presence_qualified',
-    'v_player_presence_insufficient',
-    'v_disagreement',
-    'v_trend'
-  ] loop
-    execute format('alter view %I set (security_invoker = on);', v);
-    execute format('revoke all on %I from anon;', v);
-    execute format('grant select on %I to authenticated;', v);
-  end loop;
-end $$;
+-- ===========================================================================
+-- Grants: no anon access; authenticated only (base-table RLS still applies).
+-- ===========================================================================
+revoke all on v_game_summary    from anon;
+revoke all on v_headcount_effect from anon;
+revoke all on v_daytime_effect  from anon;
+revoke all on v_player_presence from anon;
+revoke all on v_trend           from anon;
+
+grant select on v_game_summary    to authenticated;
+grant select on v_headcount_effect to authenticated;
+grant select on v_daytime_effect  to authenticated;
+grant select on v_player_presence to authenticated;
+grant select on v_trend           to authenticated;

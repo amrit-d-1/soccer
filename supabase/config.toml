@@ -4,9 +4,9 @@
 
 project_id = "soccer"
 
-[functions.send-rating-requests]
-# Triggered by the authenticated admin app (functions.invoke with the user's
-# JWT). Require a valid JWT so this cannot be called anonymously.
+[functions.send-game-sms]
+# Triggered by the authenticated organizer app (functions.invoke with the
+# user's JWT). Require a valid JWT so this cannot be called anonymously.
 verify_jwt = true
 
 [functions.twilio-inbound]
