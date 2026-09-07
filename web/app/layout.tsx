@@ -2,8 +2,8 @@ import type { Metadata, Viewport } from 'next';
 import './globals.css';
 
 export const metadata: Metadata = {
-  title: 'Rate the game',
-  description: 'Rate this week’s pickup soccer game.',
+  title: 'Soccer Game',
+  description: 'RSVP for pickup soccer and rate the games.',
   robots: { index: false, follow: false },
 };
 

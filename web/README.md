@@ -1,75 +1,82 @@
-# Soccer rating web page
+# Soccer Game — Web App
 
-Player-facing, magic-link rating page for the weekly pickup-soccer
-game-quality tracker. Next.js (App Router) + TypeScript, deployed to Vercel.
+One Next.js (App Router) app for **both** the organizer and players of a pickup
+soccer group. Players RSVP to games and rate the ones they played; the organizer
+schedules games, manages the roster, confirms attendance, triggers SMS, and
+views insights.
 
-There is **no login and no player accounts**. Access is by per-player magic-link
-token only: `https://<host>/r/<token>`. Each token maps to one player + one
-session via the `rating_link` table.
-
-## How it works
-
-- Single server-rendered route: `app/r/[token]/page.tsx`.
-- The page (and its Server Action) reach Postgres **only** through the Supabase
-  **service-role** key, held server-side in `lib/supabase-admin.ts`
-  (`import 'server-only'` guarantees it never enters a client bundle).
-- The browser never talks to Supabase. There is no anon key in this app; the
-  `anon` role has zero DB access by design (see `supabase/migrations/0002_rls.sql`).
-- The token is fully re-validated inside the Server Action, so submits are safe
-  regardless of what the page rendered. `session_id` and `rater_id` are always
-  derived from the token server-side — never trusted from the client.
-
-### Flow
-
-1. Look up `rating_link` by token. Missing or expired → friendly "link expired"
-   screen (HTTP 200, warm styling — not an error page).
-2. Load the session (date, location) and the roster (`appearance` → `player`
-   names) so the rater knows which game this is.
-3. Editable while `now < session.ratings_close_at`; read-only after.
-4. Pre-fill the form from this rater's own existing rating only. No averages,
-   counts, or anyone else's answers are ever loaded or shown.
-
-### The form (one phone screen, no scroll)
-
-- **Q1 (required)** — "How was the game?" 1–5, ends labelled Bad … Great.
-- **Q2 (optional)** — "Were the teams even?" 1–5, Lopsided … Even.
-- **Q3 (optional)** — one-line comment.
-- Submit → thank-you summary with an **Edit** affordance until close time.
-  After close time: read-only "Ratings are closed" with the submitted answer.
+- **Auth:** Supabase **phone OTP** (SMS one-time code, no passwords).
+- **Data access:** the app talks to Postgres as the **logged-in user** (anon key
+  + user JWT). **Row-Level Security** enforces who can read/write what. There is
+  **no service-role key** in this app — privileged work lives in Supabase edge
+  functions.
+- **Charts:** Recharts (on `/insights`).
 
 ## Environment variables
 
 Copy `.env.example` to `.env.local` and fill in:
 
-| Var | Purpose |
+| Variable | What |
 | --- | --- |
-| `SUPABASE_URL` | Your project URL, e.g. `https://xxxx.supabase.co` |
-| `SUPABASE_SERVICE_ROLE_KEY` | Service-role key. **Server-side only.** |
+| `NEXT_PUBLIC_SUPABASE_URL` | Your Supabase project URL |
+| `NEXT_PUBLIC_SUPABASE_ANON_KEY` | Your Supabase anon (public) key |
 
-> ⚠️ Never prefix these with `NEXT_PUBLIC_`. The service-role key bypasses Row
-> Level Security and must never reach the browser.
+Both are public and safe to ship to the browser. **Do not** add a service-role
+key here.
 
-## Develop
+## Supabase setup (required)
+
+**Phone OTP must be enabled in the Supabase dashboard** for sign-in to work:
+Dashboard → **Authentication → Providers → Phone** → enable it and configure an
+SMS provider (e.g. Twilio). Without this, `signInWithOtp`/`verifyOtp` will fail.
+
+This app depends on the backend contract (built separately): tables `player`,
+`game`, `rsvp`, `appearance`, `rating`, `sms_log`; RPCs `ensure_player`,
+`game_roster`; views `v_game_summary`, `v_headcount_effect`, `v_daytime_effect`,
+`v_player_presence`, `v_trend`; the `send-game-sms` edge function; and RLS
+policies. Make sure those migrations/functions are deployed.
+
+## Local development
 
 ```bash
 npm install
 npm run dev
-# open http://localhost:3000/r/<token>
 ```
+
+Open http://localhost:3000 — you'll be redirected to `/login`.
 
 ## Build
 
 ```bash
 npm run build
-npm start
+npm run start
 ```
 
-## Deploy to Vercel
+## Deploy (Vercel)
 
-1. Import the `web/` directory as the project root in Vercel.
-2. Add the two env vars above under **Project → Settings → Environment
-   Variables** (Production + Preview). Do **not** expose them to the browser —
-   plain (non-`NEXT_PUBLIC_`) server env vars are correct here.
-3. Deploy. The route `/r/<token>` is `force-dynamic`, so each visit re-checks
-   token validity and close time.
-```
+1. Import the repo into Vercel; set the project **root directory** to `web/`.
+2. Add the two `NEXT_PUBLIC_*` environment variables in Vercel project settings.
+3. Deploy. Middleware refreshes the Supabase session on every request.
+
+## Routes
+
+- `/login` — phone OTP sign-in (supports `?next=` so texted links land right).
+- `/` — home: your next game with In/Out/Maybe, and recent games to rate.
+- `/game/[id]` — game details + your RSVP + roster (where invite links land).
+- `/rate/[gameId]` — rate a game you played (Overall required; Speed, Intensity
+  optional; one-line comment). Editable until ratings close.
+- `/admin` — organizer only: create/edit games, roster management, per-game SMS,
+  copy-links, and post-game attendance confirm.
+- `/insights` — organizer only: charts from the analytics views.
+- `/privacy`, `/terms` — static policy pages.
+
+## Twilio A2P / 10DLC
+
+The public policy URLs to paste into your Twilio A2P registration are:
+
+- Privacy: `https://YOUR_DOMAIN/privacy`
+- Terms: `https://YOUR_DOMAIN/terms`
+
+Both are linked from the login page footer. Before Twilio/10DLC clears, use the
+**Copy links** button in `/admin` to paste per-player game/rate links into a
+group chat.

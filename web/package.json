@@ -1,5 +1,5 @@
 {
-  "name": "soccer-rating-web",
+  "name": "soccer-web",
   "version": "1.0.0",
   "private": true,
   "scripts": {
@@ -9,11 +9,12 @@
     "lint": "next lint"
   },
   "dependencies": {
+    "@supabase/ssr": "^0.5.2",
     "@supabase/supabase-js": "^2.45.4",
     "next": "^15.1.6",
     "react": "^19.0.0",
     "react-dom": "^19.0.0",
-    "server-only": "^0.0.1"
+    "recharts": "^2.13.3"
   },
   "devDependencies": {
     "@types/node": "^20.14.0",
